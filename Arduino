@@ -1,0 +1,266 @@
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include "DHT.h"
+#include <LiquidCrystal_I2C.h>
+
+// =====================
+// Konfigurasi WiFi
+// =====================
+const char* ssid = "Fasilkom-IoT";
+const char* password = "fasilkomUn3j";
+
+// =====================
+// Konfigurasi MQTT
+// =====================
+const char* mqtt_server = "103.197.188.141";
+const int mqtt_port = 1883;
+const char* mqtt_user = "fabian";
+const char* mqtt_pass = "010105";
+
+// =====================
+// Pin Setup ESP32
+// =====================
+#define RELAY_PIN 32
+#define RELAY2_PIN 4
+#define SOIL_PIN 34
+#define LED_PIN 23
+
+DHT dht(25, DHT22);
+
+// =====================
+// LCD 16x2 I2C
+// =====================
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+String relayStatus = "OFF";
+String relay2Status = "OFF";
+String modeControl = "manual";  // default MANUAL
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ============================
+// Fungsi Hitung Soil (%)
+// ============================
+float bacaSoilPersen() {
+  int raw = analogRead(SOIL_PIN);
+
+  const int basah = 1200;
+  const int kering = 2500;
+
+  float persen = map(raw, kering, basah, 0, 100);
+  persen = constrain(persen, 0, 100);
+
+  Serial.print("Soil Raw = ");
+  Serial.print(raw);
+  Serial.print(" | Persen = ");
+  Serial.println(persen);
+
+  return persen;
+}
+
+// ============================
+// DHT Sensor
+// ============================
+float bacaSuhu() {
+  float t = dht.readTemperature();
+  return isnan(t) ? -100 : t;
+}
+
+float bacaHum() {
+  float h = dht.readHumidity();
+  return isnan(h) ? -100 : h;
+}
+
+// ============================
+// Relay Control
+// ============================
+void relayOn() {
+  digitalWrite(RELAY_PIN, LOW);
+  relayStatus = "ON";
+}
+
+void relayOff() {
+  digitalWrite(RELAY_PIN, HIGH);
+  relayStatus = "OFF";
+}
+
+void relay2On() {
+  digitalWrite(RELAY2_PIN, LOW);
+  relay2Status = "ON";
+}
+
+void relay2Off() {
+  digitalWrite(RELAY2_PIN, HIGH);
+  relay2Status = "OFF";
+}
+
+// ============================
+// Callback MQTT
+// ============================
+void callback(char* topic, byte* message, unsigned int length) {
+  String msg = "";
+  for (int i = 0; i < length; i++) msg += (char)message[i];
+
+  Serial.print("Pesan MQTT: ");
+  Serial.println(msg);
+
+  // ==================================
+  // Relay 1 manual
+  // ==================================
+  if (String(topic) == "kontrol/relay" && modeControl == "manual") {
+    if (msg == "on") relayOn();
+    if (msg == "off") relayOff();
+  }
+
+  // ==================================
+  // Relay 2 manual
+  // ==================================
+  if (String(topic) == "kontrol/relay2" && modeControl == "manual") {
+    if (msg == "on") relay2On();
+    if (msg == "off") relay2Off();
+  }
+
+  // ==================================
+  // MODE Control
+  // ==================================
+  if (String(topic) == "kontrol/mode") {
+
+    // MASUK MODE AUTO = reset state
+    if (msg == "auto") {
+      modeControl = "auto";
+      Serial.println("Mode berubah -> AUTO");
+
+      float soil = bacaSoilPersen();
+      float suhu = bacaSuhu();
+
+      // Aturan langsung diterapkan
+      if (soil < 40) relayOn();
+      else relayOff();
+
+      if (suhu <= 24) relay2On();
+      else relay2Off();
+    }
+
+    // MASUK MODE MANUAL = no reset
+    if (msg == "manual") {
+      modeControl = "manual";
+      Serial.println("Mode berubah -> MANUAL");
+    }
+  }
+}
+
+// ============================
+// Setup WiFi
+// ============================
+void setup_wifi() {
+  Serial.println("Menghubungkan ke WiFi...");
+  WiFi.begin(ssid, password);
+
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println("\nWiFi Connected!");
+  Serial.print("IP Address: ");
+  Serial.println(WiFi.localIP());
+}
+
+// ============================
+// Reconnect MQTT
+// ============================
+void reconnect() {
+  while (!client.connected()) {
+    Serial.print("Menghubungkan ke MQTT... ");
+    if (client.connect("ESP32_Client1", mqtt_user, mqtt_pass)) {
+      Serial.println("BERHASIL!");
+      client.subscribe("kontrol/relay");
+      client.subscribe("kontrol/relay2");
+      client.subscribe("kontrol/mode");
+    } else {
+      Serial.print("Gagal, code=");
+      Serial.println(client.state());
+      delay(2000);
+    }
+  }
+}
+
+// ============================
+// Setup
+// ============================
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(RELAY_PIN, OUTPUT);
+  pinMode(RELAY2_PIN, OUTPUT);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(SOIL_PIN, INPUT);
+
+  relayOff();
+  relay2Off();
+
+  dht.begin();
+  lcd.init();
+  lcd.backlight();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Starting...");
+
+  setup_wifi();
+  client.setServer(mqtt_server, mqtt_port);
+  client.setCallback(callback);
+
+  delay(1500);
+  lcd.clear();
+}
+
+// ============================
+// LOOP
+// ============================
+void loop() {
+  if (!client.connected()) reconnect();
+  client.loop();
+
+  float soil = bacaSoilPersen();
+  float suhu = bacaSuhu();
+  float hum = bacaHum();
+
+  client.publish("sensor/soil", String(soil).c_str());
+  client.publish("sensor/suhu", String(suhu).c_str());
+  client.publish("sensor/kelembapan", String(hum).c_str());
+
+  digitalWrite(LED_PIN, !digitalRead(LED_PIN));
+
+  // ============================
+  // MODE OTOMATIS
+  // ============================
+  if (modeControl == "auto") {
+
+    if (soil < 40) relayOn();
+    if (soil > 60) relayOff();
+
+    if (suhu <= 24) relay2On();
+    if (suhu > 24) relay2Off();
+  }
+
+  // ============================
+  // LCD Display
+  // ============================
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("T:");
+  lcd.print(suhu);
+  lcd.print(" H:");
+  lcd.print(hum);
+
+  lcd.setCursor(0, 1);
+  lcd.print("S:");
+  lcd.print(soil);
+  lcd.print("% ");
+
+  lcd.print(relayStatus);   // Relay 1
+  lcd.print("/");
+  lcd.print(relay2Status);
+  delay(2000);
+}
